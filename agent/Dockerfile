@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY graph ./graph
 COPY tools ./tools
+COPY services ./services
 COPY templates ./templates
 COPY worker.py ./
 

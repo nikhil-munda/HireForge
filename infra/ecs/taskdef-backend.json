@@ -27,7 +27,8 @@
       ],
       "secrets": [
         { "name": "MONGODB_URI", "valueFrom": "__MONGODB_URI_SECRET_ARN__" },
-        { "name": "JWT_SECRET", "valueFrom": "__JWT_SECRET_SECRET_ARN__" }
+        { "name": "JWT_SECRET", "valueFrom": "__JWT_SECRET_SECRET_ARN__" },
+        { "name": "INTERNAL_WORKER_TOKEN", "valueFrom": "__INTERNAL_WORKER_TOKEN_SECRET_ARN__" }
       ],
       "healthCheck": {
         "command": ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""],

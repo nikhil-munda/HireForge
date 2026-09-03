@@ -35,6 +35,8 @@ Pass secrets through ECS task definitions using either:
 
 Use task roles for AWS access. Static `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are no longer required in ECS.
 
+Use the same `INTERNAL_WORKER_TOKEN` secret for the backend and agent task definitions. The agent posts progress to `BACKEND_INTERNAL_URL`, and the backend broadcasts those updates to authenticated WebSocket clients.
+
 ## Deploy flow
 
 1. Build and push images:

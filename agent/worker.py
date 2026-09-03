@@ -1,9 +1,6 @@
 import json
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -11,13 +8,17 @@ import boto3
 import fitz  # PyMuPDF
 import pymongo
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
 
+ROOT_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(ROOT_ENV_PATH, override=True)
 load_dotenv(ENV_PATH, override=True)
 
 from graph.graph import graph
+from services.job_lifecycle import JobLifecycle
+from services.progress_notifier import ProgressNotifier
+from services.resume_renderer import ResumeRenderer
 
 REQUIRED_ENV = [
     "MONGODB_URI",
@@ -62,12 +63,16 @@ jobs = db["jobs"]
 QUEUE_URL = os.environ["SQS_QUEUE_URL"]
 BUCKET = os.environ["S3_BUCKET"]
 LATEX_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "shivansh_one_page_resume.tex"
+job_lifecycle = JobLifecycle(jobs, sqs, QUEUE_URL)
+set_status = job_lifecycle.set_status
+progress_notifier = ProgressNotifier()
 
 llm = ChatGroq(
     model=os.environ["GROQ_MODEL"],
     temperature=0.2,
     max_tokens=8192,
 )
+resume_renderer = ResumeRenderer(llm, LATEX_TEMPLATE_PATH)
 
 
 def extract_text_from_s3(s3_key: str) -> str:
@@ -76,465 +81,139 @@ def extract_text_from_s3(s3_key: str) -> str:
     return "\n".join(page.get_text() for page in pdf)
 
 
-def set_status(job_id: str, status: str, extra: dict | None = None):
-    if extra is None:
-        extra = {}
-    jobs.update_one({"_id": job_id}, {"$set": {"status": status, **extra}})
+def publish_progress(job_id: str, progress: list[str], status: str = "processing"):
+    set_status(job_id, status, {"progress": progress})
+    progress_notifier.publish(job_id, progress, status)
 
 
-def _parse_json(text: str):
-    clean = text.replace("```json", "").replace("```", "").strip()
-    # Try the whole string first
-    try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        pass
-    # Find the first valid JSON object via bracket-matching
-    decoder = json.JSONDecoder()
-    for i, char in enumerate(clean):
-        if char in ('{', '['):
-            try:
-                obj, _ = decoder.raw_decode(clean, i)
-                return obj
-            except json.JSONDecodeError:
-                continue
-    raise json.JSONDecodeError("No valid JSON found", clean, 0)
-
-
-def _latex_escape(value: str) -> str:
-    replacements = {
-        "\\": r"\textbackslash{}",
-        "&": r"\&",
-        "%": r"\%",
-        "$": r"\$",
-        "#": r"\#",
-        "_": r"\_",
-        "{": r"\{",
-        "}": r"\}",
-        "~": r"\textasciitilde{}",
-        "^": r"\textasciicircum{}",
-    }
-    return "".join(replacements.get(char, char) for char in (value or ""))
-
-
-def _latex_escape_url(url: str) -> str:
-    """Escape only the chars that break LaTeX inside \\href{...} URL context."""
-    return (url or "").replace("%", "\\%").replace("#", "\\#")
-
-
-def _compact(items, limit):
-    return [item for item in items if item][:limit]
-
-
-def _document_to_parsed_resume(document: dict) -> dict:
-    """Convert the build_resume_document output into the format compute_ats_score expects."""
-    skills = []
-    for group in document.get("skill_groups", []):
-        skills.extend(group.get("items", []))
-
-    experience = document.get("experience", [])
-
-    education = [
-        {
-            "degree": edu.get("degree", ""),
-            "institution": edu.get("institution", ""),
-            "year": edu.get("date", ""),
-        }
-        for edu in document.get("education", [])
-    ]
-
-    # Use achievements as a summary proxy since the document has no summary field
-    summary = " ".join(
-        item.get("text", "") for item in document.get("achievements", [])
-    )
-
-    return {
-        "skills": skills,
-        "experience": experience,
-        "education": education,
-        "summary": summary,
-    }
-
-
-def _load_latex_template() -> str:
-    return LATEX_TEMPLATE_PATH.read_text(encoding="utf-8")
-
-
-def build_resume_document(resume_text: str, source_resume_text: str, template_kind: str) -> dict:
-    # Determine content volume to decide one-page vs two-page
-    word_count = len(source_resume_text.split())
-    page_instruction = (
-        "Optimize for a clean two-page layout."
-        if word_count > 600
-        else "Optimize for one page only."
-    )
-
-    prompt = f"""
-Convert the resume below into structured JSON for a LaTeX resume.
-Return ONLY valid JSON. Do not include markdown fences.
-
-TEMPLATE FAMILY: {template_kind}
-
-JSON FORMAT:
-{{
-  "name": "Candidate name",
-  "phone": "phone or empty string",
-  "email": "email or empty string",
-  "linkedin": "linkedin url or empty string",
-  "github": "github url or empty string",
-  "education": [
-    {{
-      "institution": "Institute",
-      "date": "Aug 2023 -- May 2027",
-      "degree": "Degree",
-      "detail": "CGPA or equivalent"
-    }}
-  ],
-  "experience": [
-    {{
-      "title": "Job Title",
-      "company": "Company Name",
-      "date": "Jun 2023 -- Aug 2024",
-      "bullets": ["bullet 1", "bullet 2"]
-    }}
-  ],
-  "skill_groups": [
-    {{
-      "label": "AI / GenAI",
-      "items": ["LLMs", "RAG", "Prompt Engineering"]
-    }}
-  ],
-  "projects": [
-    {{
-      "url": "https://...",
-      "title": "Project title",
-      "date": "2026",
-      "stack": "Python | LangChain | ...",
-      "bullets": ["bullet", "bullet"]
-    }}
-  ],
-  "achievements": [
-    {{
-      "text": "achievement line"
-    }}
-  ]
-}}
-
-RULES:
-- Preserve truth from the resume. Never fabricate missing facts.
-- If a field is unknown, use an empty string or empty list.
-- {page_instruction}
-- Include ALL work experience roles from the source resume. Do not drop any employer.
-- Keep at most 3 education items, 3 experience entries with up to 4 bullets each,
-  6 skill groups, 5 projects with up to 4 bullets each, and 6 achievements.
-- If the source resume has NO work experience at all, return an empty "experience" array.
-- Bullets must be concise, ATS-strong, and quantifiable when the source supports that.
-- Reflect the target JD keywords naturally, but never invent experience.
-
-REWRITTEN RESUME:
-{resume_text}
-
-ORIGINAL SOURCE RESUME:
-{source_resume_text[:15000]}
-"""
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-
-    try:
-        document = _parse_json(response.content)
-        if isinstance(document, dict):
-            document["education"]    = _compact(document.get("education", []), 3)
-            document["experience"]   = _compact(document.get("experience", []), 3)
-            for exp in document["experience"]:
-                exp["bullets"] = _compact(exp.get("bullets", []), 4)
-            document["skill_groups"] = _compact(document.get("skill_groups", []), 6)
-            document["projects"]     = _compact(document.get("projects", []), 5)
-            for project in document["projects"]:
-                project["bullets"] = _compact(project.get("bullets", []), 4)
-            document["achievements"] = _compact(document.get("achievements", []), 6)
-            return document
-    except Exception:
-        pass
-
-    return {
-        "name": "Candidate Resume",
-        "phone": "",
-        "email": "",
-        "linkedin": "",
-        "github": "",
-        "education": [],
-        "experience": [],
-        "skill_groups": [],
-        "projects": [],
-        "achievements": [],
-    }
-
-
-def build_resume_latex(document: dict) -> str:
-    template = _load_latex_template()
-    name = _latex_escape(document.get("name") or "Candidate Resume")
-    phone = document.get("phone") or ""
-    email = document.get("email") or ""
-    linkedin = document.get("linkedin") or ""
-    github = document.get("github") or ""
-
-    header_parts = []
-    if phone:
-        header_parts.append(rf"\href{{tel:{phone}}}{{{_latex_escape(phone)}}}")
-    if email:
-        header_parts.append(rf"\href{{mailto:{email}}}{{{_latex_escape(email)}}}")
-    if linkedin:
-        header_parts.append(
-            rf"\href{{{linkedin}}}{{{_latex_escape(linkedin.replace('https://', '').replace('http://', ''))}}}"
-        )
-    if github:
-        header_parts.append(
-            rf"\href{{{github}}}{{{_latex_escape(github.replace('https://', '').replace('http://', ''))}}}"
-        )
-
-    header_line = r"\enspace\textbar\enspace".join(header_parts)
-
-    education_block = ""
-    if document.get("education"):
-        edu = document["education"][0]
-        education_block = rf"""\section{{Education}}
-\resumeSubheading
-  {{{_latex_escape(edu.get("institution", ""))}}}{{{_latex_escape(edu.get("date", ""))}}}
-  {{{_latex_escape(edu.get("degree", ""))}}}{{{_latex_escape(edu.get("detail", ""))}}}
-
-\vspace{{2pt}}
-"""
-
-    skill_rows = []
-    for group in document.get("skill_groups", []):
-        label = _latex_escape(group.get("label", "Skills"))
-        items = _latex_escape(", ".join(group.get("items", [])))
-        if items:
-            skill_rows.append(rf"  \small\textbf{{{label}}} & \small {items} \\[2pt]")
-
-    skills_block = ""
-    if skill_rows:
-        final_rows = skill_rows[:-1]
-        final_rows.append(skill_rows[-1].replace(r"\\[2pt]", r"\\"))
-        skills_block = "\\section{Technical Skills}\n\\begin{tabular*}{\\textwidth}{@{}l@{\\hskip 6pt}l}\n"
-        skills_block += "\n".join(final_rows)
-        skills_block += "\n\\end{tabular*}\n\n\\vspace{2pt}\n"
-
-    project_chunks = []
-    for project in document.get("projects", []):
-        bullets = "\n".join(
-            rf"  \resumeItem{{{_latex_escape(bullet)}}}"
-            for bullet in project.get("bullets", [])
-            if bullet
-        )
-        project_chunks.append(rf"""\projectHeading
-  {{{_latex_escape_url(project.get("url", ""))}}}
-  {{{_latex_escape(project.get("title", ""))}}}
-  {{{_latex_escape(project.get("date", ""))}}}
-\projectStack{{{_latex_escape(project.get("stack", ""))}}}
-\begin{{itemize}}
-{bullets}
-\end{{itemize}}
-
-\vspace{{2pt}}
-""")
-
-    projects_block = ""
-    if project_chunks:
-        projects_block = "\\section{Projects}\n\n" + "\n".join(project_chunks)
-
-    achievement_items = "\n".join(
-        rf"  \resumeItem{{{_latex_escape(item.get('text', ''))}}}"
-        for item in document.get("achievements", [])
-        if item.get("text")
-    )
-    achievements_block = ""
-    if achievement_items:
-        achievements_block = rf"""\section{{Achievements \& Certifications}}
-\begin{{itemize}}
-{achievement_items}
-\end{{itemize}}
-"""
-    # ── Experience section ─────────────────────────────────────────────────────
-    experience_chunks = []
-    for exp in document.get("experience", []):
-        bullets = "\n".join(
-            rf"  \resumeItem{{{_latex_escape(bullet)}}}"
-            for bullet in exp.get("bullets", [])
-            if bullet
-        )
-        experience_chunks.append(rf"""\resumeSubheading
-  {{{_latex_escape(exp.get("company", ""))}}}{{{_latex_escape(exp.get("date", ""))}}}
-  {{{_latex_escape(exp.get("title", ""))}}}{{{{}}}}\begin{{itemize}}
-{bullets}
-\end{{itemize}}
-""")
-
-    experience_block = ""
-    if experience_chunks:
-        experience_block = "\\section{Experience}\n\n" + "\n".join(experience_chunks)
-
-    return (
-        template
-        .replace("<<NAME>>", name)
-        .replace("<<HEADER_LINE>>", header_line or r"\mbox{}")
-        .replace("<<EDUCATION_BLOCK>>", education_block or "% No education data")
-        .replace("<<EXPERIENCE_BLOCK>>", experience_block or "% No experience data")
-        .replace("<<SKILLS_BLOCK>>", skills_block or "% No skills data")
-        .replace("<<PROJECTS_BLOCK>>", projects_block or "% No projects data")
-        .replace("<<ACHIEVEMENTS_BLOCK>>", achievements_block or "% No achievements data")
-    )
-
-
-def compile_latex_to_pdf(latex_source: str) -> bytes:
-    engine = next(
-        (candidate for candidate in ("pdflatex", "xelatex", "lualatex", "tectonic") if shutil.which(candidate)),
-        None,
-    )
-
-    if not engine:
-        raise RuntimeError("No LaTeX compiler installed on the worker.")
-
-    with tempfile.TemporaryDirectory(prefix="resume-tex-") as temp_dir:
-        temp_path = Path(temp_dir)
-        tex_path = temp_path / "resume.tex"
-        tex_path.write_text(latex_source, encoding="utf-8")
-        tex_env = os.environ.copy()
-        tex_env["TEXMFVAR"] = str(temp_path / ".texmf-var")
-        tex_env["TEXMFCONFIG"] = str(temp_path / ".texmf-config")
-        tex_env["TEXMFHOME"] = str(temp_path / ".texmf-home")
-
-        if engine == "tectonic":
-            command = [engine, "--keep-logs", "--outdir", str(temp_path), str(tex_path)]
-        else:
-            command = [
-                engine,
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-output-directory",
-                str(temp_path),
-                str(tex_path),
-            ]
-
-        result = subprocess.run(
-            command,
-            cwd=temp_path,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-            env=tex_env,
-        )
-
-        pdf_path = temp_path / "resume.pdf"
-        if result.returncode != 0 or not pdf_path.exists():
-            stderr = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(stderr[-1200:] or "LaTeX compilation failed.")
-
-        return pdf_path.read_bytes()
-
-
-def process_job(job_id: str):
+def process_job(job_id: str, receipt_handle: str) -> bool:
     print(f"[worker] Processing job {job_id}")
-    job = jobs.find_one({"_id": job_id})
+    job, claim_action = job_lifecycle.claim_job(job_id)
     if not job:
-        print(f"[worker] Job {job_id} not found in DB — skipping")
-        return
+        return claim_action == "delete"
 
-    set_status(job_id, "processing")
-
-    try:
-        resume_text = extract_text_from_s3(job["resumeS3Key"])
-    except Exception as error:
-        set_status(job_id, "failed", {"errorMessage": f"PDF extraction failed: {error}"})
-        return
-
-    initial_state = {
-        "job_id": job_id,
-        "resume_text": resume_text,
-        "jd_text": job["jdText"],
-        "template_kind": job.get("templateKind", "sde"),
-        "target_score": job.get("targetScore", 90),
-        "parsed_resume": {},
-        "parsed_jd": {},
-        "ats_score": 0,
-        "keyword_map": {},
-        "gaps": [],
-        "rewritten_resume": None,
-        "rendered_resume_text": None,
-        "suggestions": [],
-        "iteration": 0,
-        "final_score": None,
-        "progress": [],
-    }
+    stop_heartbeat, heartbeat_thread = job_lifecycle.start_visibility_heartbeat(job_id, receipt_handle)
+    progress = ["Worker claimed the job and started processing."]
+    publish_progress(job_id, progress)
 
     try:
-        result = graph.invoke(initial_state)
-    except Exception as error:
-        set_status(job_id, "failed", {"errorMessage": f"Agent error: {error}"})
-        print(f"[worker] Agent failed for {job_id}: {error}")
-        return
+        try:
+            progress.append("Extracting resume text from the uploaded PDF.")
+            publish_progress(job_id, progress)
+            resume_text = extract_text_from_s3(job["resumeS3Key"])
+        except Exception as error:
+            progress.append(f"PDF extraction failed: {error}")
+            publish_progress(job_id, progress, "failed")
+            set_status(job_id, "failed", {"errorMessage": f"PDF extraction failed: {error}"})
+            raise RuntimeError(f"PDF extraction failed: {error}") from error
 
-    final_resume_text = result.get("rewritten_resume") or resume_text
-    generated_resume_key = None
-    generated_resume_tex = None
+        initial_state = {
+            "job_id": job_id,
+            "resume_text": resume_text,
+            "jd_text": job["jdText"],
+            "template_kind": job.get("templateKind", "sde"),
+            "target_score": job.get("targetScore", 90),
+            "parsed_resume": {},
+            "parsed_jd": {},
+            "ats_score": 0,
+            "keyword_map": {},
+            "gaps": [],
+            "rewritten_resume": None,
+            "rendered_resume_text": None,
+            "suggestions": [],
+            "iteration": 0,
+            "final_score": None,
+            "progress": [],
+        }
 
-    try:
-        resume_document = build_resume_document(
-            final_resume_text,
-            resume_text,
-            job.get("templateKind", "sde"),
+        try:
+            progress.append("Running the LangGraph resume optimization pipeline.")
+            publish_progress(job_id, progress)
+            result = graph.invoke(initial_state)
+        except Exception as error:
+            progress.append(f"Agent pipeline failed: {error}")
+            publish_progress(job_id, progress, "failed")
+            set_status(job_id, "failed", {"errorMessage": f"Agent error: {error}"})
+            print(f"[worker] Agent failed for {job_id}: {error}")
+            raise RuntimeError(f"Agent error: {error}") from error
+
+        result_progress = result.get("progress", [])
+        if result_progress:
+            progress = progress + [step for step in result_progress if step not in progress]
+            publish_progress(job_id, progress)
+
+        final_resume_text = result.get("rewritten_resume") or resume_text
+        generated_resume_key = None
+        generated_resume_tex = None
+
+        try:
+            progress.append("Building structured resume content for the LaTeX template.")
+            publish_progress(job_id, progress)
+            resume_document = resume_renderer.build_resume_document(
+                final_resume_text,
+                resume_text,
+                job.get("templateKind", "sde"),
+            )
+            progress.append("Compiling the final resume PDF.")
+            publish_progress(job_id, progress)
+            generated_resume_tex = resume_renderer.build_resume_latex(resume_document)
+            pdf_bytes = resume_renderer.compile_latex_to_pdf(generated_resume_tex)
+            generated_resume_key = f"generated-resumes/{job['userId']}/{job_id}.pdf"
+            s3.put_object(
+                Bucket=BUCKET,
+                Key=generated_resume_key,
+                Body=pdf_bytes,
+                ContentType="application/pdf",
+            )
+            result["rendered_resume_text"] = json.dumps(resume_document)
+            progress.append("Generated final resume PDF from the LaTeX template.")
+            result["progress"] = progress
+
+            # ── Post-PDF scoring (Bug #4 fix): score the ACTUAL document that
+            #    became the PDF, not the fabricated hybrid from the graph.  This
+            #    ensures the number shown to the user matches the real file.
+            from tools.ats_scorer import compute_ats_score
+            scorer_resume = resume_renderer.document_to_parsed_resume(resume_document)
+            pdf_score, pdf_keyword_map, pdf_gaps = compute_ats_score(
+                scorer_resume, result.get("parsed_jd", {})
+            )
+            result["final_score"] = pdf_score
+            result["keyword_map"] = pdf_keyword_map
+            result["gaps"] = pdf_gaps
+            progress.append(f"Re-scored from actual PDF content: {pdf_score}/100.")
+            result["progress"] = progress
+        except Exception as error:
+            progress.append(f"LaTeX PDF generation failed: {error}")
+            result["progress"] = progress
+
+        progress = result.get("progress", progress)
+
+        set_status(
+            job_id,
+            "done",
+            {
+                "originalScore": result["ats_score"],
+                "finalScore": result["final_score"],
+                "rewrittenResume": result.get("rewritten_resume"),
+                "renderedResumeText": result.get("rendered_resume_text"),
+                "generatedResumeTex": generated_resume_tex,
+                "generatedResumeS3Key": generated_resume_key,
+                "gaps": result["gaps"],
+                "suggestions": result["suggestions"],
+                "keywordMap": result["keyword_map"],
+                "iterations": result["iteration"],
+                "templateKind": job.get("templateKind", "sde"),
+                "targetScore": job.get("targetScore", 90),
+                "progress": result.get("progress", []),
+            },
         )
-        generated_resume_tex = build_resume_latex(resume_document)
-        pdf_bytes = compile_latex_to_pdf(generated_resume_tex)
-        generated_resume_key = f"generated-resumes/{job['userId']}/{job_id}.pdf"
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=generated_resume_key,
-            Body=pdf_bytes,
-            ContentType="application/pdf",
-        )
-        result["rendered_resume_text"] = json.dumps(resume_document)
-        result["progress"] = result.get("progress", []) + ["Generated final resume PDF from the LaTeX template."]
+        progress_notifier.publish(job_id, progress, "done")
 
-        # ── Post-PDF scoring (Bug #4 fix): score the ACTUAL document that
-        #    became the PDF, not the fabricated hybrid from the graph.  This
-        #    ensures the number shown to the user matches the real file.
-        from tools.ats_scorer import compute_ats_score
-        scorer_resume = _document_to_parsed_resume(resume_document)
-        pdf_score, pdf_keyword_map, pdf_gaps = compute_ats_score(
-            scorer_resume, result.get("parsed_jd", {})
-        )
-        result["final_score"] = pdf_score
-        result["keyword_map"] = pdf_keyword_map
-        result["gaps"] = pdf_gaps
-        result["progress"] = result["progress"] + [
-            f"Re-scored from actual PDF content: {pdf_score}/100."
-        ]
-    except Exception as error:
-        result["progress"] = result.get("progress", []) + [f"LaTeX PDF generation failed: {error}"]
-
-    set_status(
-        job_id,
-        "done",
-        {
-            "originalScore": result["ats_score"],
-            "finalScore": result["final_score"],
-            "rewrittenResume": result.get("rewritten_resume"),
-            "renderedResumeText": result.get("rendered_resume_text"),
-            "generatedResumeTex": generated_resume_tex,
-            "generatedResumeS3Key": generated_resume_key,
-            "gaps": result["gaps"],
-            "suggestions": result["suggestions"],
-            "keywordMap": result["keyword_map"],
-            "iterations": result["iteration"],
-            "templateKind": job.get("templateKind", "sde"),
-            "targetScore": job.get("targetScore", 90),
-            "progress": result.get("progress", []),
-        },
-    )
-
-    print(f"[worker] Job {job_id} done. Score: {result['ats_score']} → {result['final_score']}")
+        print(f"[worker] Job {job_id} done. Score: {result['ats_score']} → {result['final_score']}")
+        return True
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=1)
 
 
 def poll():
@@ -547,6 +226,7 @@ def poll():
                 QueueUrl=QUEUE_URL,
                 MaxNumberOfMessages=1,
                 WaitTimeSeconds=20,
+                VisibilityTimeout=job_lifecycle.visibility_timeout,
             )
             messages = response.get("Messages", [])
 
@@ -555,19 +235,29 @@ def poll():
 
             print(f"[worker] Received {len(messages)} message(s)")
             for message in messages:
-                body = json.loads(message["Body"])
-                job_id = body["jobId"]
+                should_delete = False
 
                 try:
-                    process_job(job_id)
+                    body = json.loads(message["Body"])
+                    job_id = body["jobId"]
+                except Exception as error:
+                    print(f"[worker] Malformed message deleted: {error}")
+                    should_delete = True
+
+                try:
+                    if not should_delete:
+                        should_delete = process_job(job_id, message["ReceiptHandle"])
                 except Exception as error:
                     print(f"[worker] Unhandled error for {job_id}: {error}")
                     set_status(job_id, "failed", {"errorMessage": str(error)})
-                finally:
+
+                if should_delete:
                     sqs.delete_message(
                         QueueUrl=QUEUE_URL,
                         ReceiptHandle=message["ReceiptHandle"],
                     )
+                else:
+                    print(f"[worker] Leaving message for SQS retry: {job_id}")
 
         except KeyboardInterrupt:
             print("\n[worker] Shutting down.")

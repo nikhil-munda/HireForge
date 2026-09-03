@@ -31,6 +31,9 @@ const runUpload = (req, res) => new Promise((resolve, reject) => {
   });
 });
 
+const isPdfBuffer = (buffer) =>
+  Buffer.isBuffer(buffer) && buffer.length >= 5 && buffer.subarray(0, 5).toString('ascii') === '%PDF-';
+
 router.post('/', requireAuth, async (req, res) => {
   let jobId;
 
@@ -40,6 +43,9 @@ router.post('/', requireAuth, async (req, res) => {
     const { jdText, templateKind = 'sde', targetScore } = req.body;
     if (!jdText?.trim()) return res.status(400).json({ error: 'Job description is required' });
     if (!req.file)       return res.status(400).json({ error: 'PDF resume is required' });
+    if (!isPdfBuffer(req.file.buffer)) {
+      return res.status(400).json({ error: 'Uploaded resume is not a valid PDF file.' });
+    }
     if (!['sde', 'ai', 'etc'].includes(templateKind)) {
       return res.status(400).json({ error: 'Unsupported resume template' });
     }

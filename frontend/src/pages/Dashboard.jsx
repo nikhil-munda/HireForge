@@ -80,15 +80,21 @@ export default function Dashboard() {
 
   useWebSocket(selectedJobId, (message) => {
     const progress = normalizeProgress(message?.progress);
-    if (progress.length === 0) {
+    const status = normalizeStatus(message?.status);
+    if (progress.length === 0 && !status) {
       return;
     }
 
     setJob((current) => (
       current
-        ? { ...current, progress }
+        ? { ...current, ...(progress.length > 0 ? { progress } : {}), ...(status ? { status } : {}) }
         : current
     ));
+
+    if (['done', 'failed'].includes(status) && message?.jobId === selectedJobId) {
+      loadJobs(selectedJobId);
+      loadJob(selectedJobId);
+    }
   });
 
   async function handleCreateAnalysis({ file, jdText, templateKind }) {
@@ -297,7 +303,13 @@ function normalizeJobs(payload) {
 }
 
 function normalizeProgress(progress) {
-  return Array.isArray(progress) ? progress : [];
+  return Array.isArray(progress)
+    ? progress.filter((step) => typeof step === 'string' && step.trim())
+    : [];
+}
+
+function normalizeStatus(status) {
+  return ['queued', 'processing', 'done', 'failed'].includes(status) ? status : null;
 }
 
 function normalizeJob(payload) {

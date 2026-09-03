@@ -24,8 +24,16 @@ const jobSchema = new mongoose.Schema({
   suggestions:     [suggestionSchema],
   keywordMap:      mongoose.Schema.Types.Mixed,
   iterations:      { type: Number, default: 0 },
+  progress:        [String],
   errorMessage:    String,
+  attemptCount:    { type: Number, default: 0 },
+  processingStartedAt: Date,
+  processingHeartbeatAt: Date,
+  completedAt:     Date,
+  failedAt:        Date,
   createdAt:       { type: Date, default: Date.now },
 });
+
+jobSchema.index({ userId: 1, createdAt: -1 });
 
 export default mongoose.model('Job', jobSchema);

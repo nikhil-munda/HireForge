@@ -30,12 +30,17 @@ Set these in Secrets Manager or ECS task definitions:
 - `GROQ_API_KEY`
 - `GROQ_MODEL`
 - `FRONTEND_URL`
+- `BACKEND_INTERNAL_URL`
+- `INTERNAL_WORKER_TOKEN`
 - `PORT=3001`
 
 Notes:
 
 - In ECS, prefer IAM task roles instead of `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
 - The `agent` container now compiles LaTeX PDFs, so its image includes TeX Live.
+- Configure the SQS jobs queue with a dead-letter queue and a redrive policy, for example `maxReceiveCount=3`.
+- The worker sets per-message visibility while receiving and extends it during long jobs. Defaults are `SQS_VISIBILITY_TIMEOUT=300`, `SQS_HEARTBEAT_INTERVAL=60`, and `PROCESSING_STALE_SECONDS=600`.
+- Set the same `INTERNAL_WORKER_TOKEN` secret on the backend and agent. The agent uses `BACKEND_INTERNAL_URL` to POST progress updates, and the backend broadcasts those updates to authenticated WebSocket clients.
 
 For the frontend container build:
 
@@ -99,11 +104,12 @@ The repository includes starter task definition templates:
 - Put ECS services in private subnets where possible.
 - Allow the backend and agent to reach S3, SQS, Groq, and Mongo.
 - Set `FRONTEND_URL` on the backend to the frontend domain.
+- Set `BACKEND_INTERNAL_URL` on the agent to the backend URL reachable from the agent task.
 - Set `VITE_API_URL` on the frontend build to the backend public URL.
 
 ## First deployment checklist
 
-1. Create the S3 bucket and SQS queue.
+1. Create the S3 bucket, SQS jobs queue, and SQS dead-letter queue.
 2. Provision DocumentDB or another Mongo-compatible database and capture the connection string.
 3. Store secrets in Secrets Manager.
 4. Build and push the three images to ECR.

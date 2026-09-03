@@ -16,11 +16,12 @@ services:
       context: ./backend
     restart: unless-stopped
     env_file:
-      - ./.env.deploy
+      - ./.env
     environment:
       MONGODB_URI: mongodb://mongo:27017/${MONGODB_DB:-resumeforge}
       PORT: 3001
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      INTERNAL_WORKER_TOKEN: ${INTERNAL_WORKER_TOKEN:-dev-worker-progress-token}
       NODE_OPTIONS: --dns-result-order=ipv4first --no-network-family-autoselection
     depends_on:
       mongo:
@@ -31,9 +32,11 @@ services:
       context: ./agent
     restart: unless-stopped
     env_file:
-      - ./.env.deploy
+      - ./.env
     environment:
       MONGODB_URI: mongodb://mongo:27017/${MONGODB_DB:-resumeforge}
+      BACKEND_INTERNAL_URL: http://backend:3001
+      INTERNAL_WORKER_TOKEN: ${INTERNAL_WORKER_TOKEN:-dev-worker-progress-token}
     depends_on:
       mongo:
         condition: service_healthy
